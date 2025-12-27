@@ -539,14 +539,7 @@ window.FarmGod.Main = (function (Library, Translation) {
     $('.farmGod_icon')
       .off('click')
       .on('click', function () {
-        if (
-          game_data.market != 'nl' ||
-          $(this).data('origin') == curVillage
-        ) {
-          sendFarm($(this));
-        } else {
-          UI.ErrorMessage(t.messages.villageError);
-        }
+      sendFarm($(this));
       });
 
     $(document)
