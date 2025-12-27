@@ -1,13 +1,34 @@
-/* FarmGod – Quickbar-safe, stable rewrite (desktop)
- * - Works when started from TW quickbar on ANY screen:
- *   redirects to am_farm and runs there.
- * - Always shows popup first (loading), then loads options.
- * - Fixes: queue selection bug, "group=all" bug, TW-not-ready timing.
+/* FarmGod – Quickbar-safe + anti-double-run + stable popup render (desktop)
+ * - Prevents double execution from quickbar (singleton guard)
+ * - Shows popup reliably (render in next tick)
+ * - Waits for TW core objects before doing anything
+ * - Fixes group "all" staying string
  * - Manual sending only (click/Enter). Arrival shown as info.
  */
 
 (function () {
   'use strict';
+
+  // ---- HARD singleton guard (prevents double-run / half popup) ----
+  if (window.FarmGod__running) {
+    // If already running, just bring popup to front if it exists
+    try {
+      if ($('#popup_box_FarmGod').length) {
+        // noop: popup already visible
+      } else {
+        UI?.InfoMessage?.('FarmGod is al actief.');
+      }
+    } catch (_) {}
+    return;
+  }
+  window.FarmGod__running = true;
+
+  const finish = () => {
+    // release guard after a short delay (prevents fast double click)
+    setTimeout(() => {
+      window.FarmGod__running = false;
+    }, 800);
+  };
 
   // Best effort register (won't crash if ScriptAPI missing)
   try {
@@ -20,6 +41,7 @@
 
   if (typeof game_data === 'undefined') {
     console.error('FarmGod: game_data missing.');
+    finish();
     return;
   }
 
@@ -27,11 +49,13 @@
   if (game_data.screen !== 'am_farm') {
     try { localStorage.setItem(AUTORUN_KEY, '1'); } catch (_) {}
     location.href = (game_data.link_base_pure || '/game.php?') + 'am_farm';
+    // keep running flag irrelevant after navigation
+    finish();
     return;
   }
 
-  // ---- Wait until TW core objects are ready (prevents "plan error" first run) ----
-  const waitForTWReady = (cb, tries = 80) => {
+  // ---- Wait until TW core objects are ready (prevents first-run failures) ----
+  const waitForTWReady = (cb, tries = 120) => {
     const ok =
       typeof $ !== 'undefined' &&
       typeof Dialog !== 'undefined' &&
@@ -45,6 +69,7 @@
     if (tries <= 0) {
       console.error('FarmGod: TW not ready (Dialog/UI/TribalWars/Accountmanager missing).');
       try { UI.ErrorMessage('FarmGod: TW nog niet klaar. Herlaad (F5) en probeer opnieuw.'); } catch (_) {}
+      finish();
       return;
     }
     setTimeout(() => waitForTWReady(cb, tries - 1), 125);
@@ -63,7 +88,7 @@
     )}:${pad2(d.getSeconds())}`;
   };
 
-  // Safe prototypes (used by original script patterns)
+  // Safe prototypes
   if (!String.prototype.toCoord) {
     String.prototype.toCoord = function (objectified) {
       const c = (this.match(/\d{1,3}\|\d{1,3}/g) || [false]).pop();
@@ -78,7 +103,7 @@
     Number.prototype.toNumber = function () { return safeNum(this); };
   }
 
-  // ---- twLib (FIXED queue selection) ----
+  // ---- twLib (queue selection fixed) ----
   if (typeof window.twLib === 'undefined') {
     window.twLib = {
       queues: null,
@@ -148,12 +173,9 @@
           return arr;
         },
         addItem(item) {
-          // FIX: pick queue index with minimum length
           const lengths = twLib.queues.map((q) => q.length);
           let minIdx = 0;
-          for (let i = 1; i < lengths.length; i++) {
-            if (lengths[i] < lengths[minIdx]) minIdx = i;
-          }
+          for (let i = 1; i < lengths.length; i++) if (lengths[i] < lengths[minIdx]) minIdx = i;
           twLib.queues[minIdx].enqueue(item);
         },
         orchestrator(type, arg) {
@@ -235,34 +257,33 @@
     return msg[game_data.locale] || msg.int;
   })();
 
-  // ---- Main script (wrapped so we can wait for TW readiness) ----
+  // ---- Main script ----
   const main = () => {
     // Feature check
     if (!(game_data?.features?.Premium?.active && game_data?.features?.FarmAssistent?.active)) {
       UI.ErrorMessage(t.missingFeatures);
+      finish();
       return;
     }
+
+    // Clean autorun flag
+    try { localStorage.removeItem(AUTORUN_KEY); } catch (_) {}
 
     // Unit speeds cache
     const getUnitSpeeds = () => {
       try {
         const raw = localStorage.getItem('FarmGod_unitSpeeds');
         return raw ? JSON.parse(raw) : false;
-      } catch (_) {
-        return false;
-      }
+      } catch (_) { return false; }
     };
 
     const setUnitSpeeds = () => {
       const unitSpeeds = {};
       return $.get('/interface.php?func=get_unit_info').then((xml) => {
-        $(xml)
-          .find('config')
-          .children()
-          .each((_, el) => {
-            const name = $(el).prop('nodeName');
-            unitSpeeds[name] = safeNum($(el).find('speed').text(), 0);
-          });
+        $(xml).find('config').children().each((_, el) => {
+          const name = $(el).prop('nodeName');
+          unitSpeeds[name] = safeNum($(el).find('speed').text(), 0);
+        });
         localStorage.setItem('FarmGod_unitSpeeds', JSON.stringify(unitSpeeds));
         return unitSpeeds;
       });
@@ -270,7 +291,6 @@
 
     if (!getUnitSpeeds()) setUnitSpeeds();
 
-    // Time helpers
     const getCurrentServerTime = () => {
       const m = ($('#serverTime').closest('p').text().match(/\d+/g) || []).map((x) => safeNum(x));
       if (m.length < 6) return Date.now();
@@ -322,50 +342,22 @@
       return res.some((v) => v < 0) ? false : res;
     };
 
-    // Page processing (multi pages)
-    const determineNextPage = (page, $html) => {
-      const isFarm = $html.find('#am_widget_Farm').length > 0;
-      const navSelect = $html.find('.paged-nav-item').first().closest('td').find('select').first();
-
-      let navLength = 0;
-      if (isFarm) {
-        const $nav = $html.find('#plunder_list_nav').first();
-        const $items = $nav.find('a.paged-nav-item, strong.paged-nav-item');
-        if ($items.length) navLength = safeNum(($items.last().text() || '').replace(/\D/g, ''), 0) - 1;
-      } else if (navSelect.length > 0) {
-        navLength = navSelect.find('option').length - 1;
-      } else {
-        navLength = $html.find('.paged-nav-item').not('[href*="page=-1"]').length;
-      }
-
-      const pageSize = $('#mobileHeader').length > 0 ? 10 : safeNum($html.find('input[name="page_size"]').val(), 25);
-      const villageLength =
-        $html.find('#scavenge_mass_screen').length > 0
-          ? $html.find('tr[id*="scavenge_village"]').length
-          : $html.find('tr.row_a, tr.row_ax, tr.row_b, tr.row_bx').length;
-
-      if (page === -1 && villageLength === 1000) return Math.floor(1000 / pageSize);
-      if (page < navLength) return page + 1;
-      return false;
+    // ---------- Popup rendering (update if exists; render next tick) ----------
+    const showPopup = (html) => {
+      // Render in next tick to avoid half popup
+      setTimeout(() => {
+        try {
+          if ($('#popup_box_FarmGod').length) {
+            $('#popup_box_FarmGod').html(html);
+          } else {
+            Dialog.show('FarmGod', html);
+          }
+        } catch (e) {
+          console.error('FarmGod popup error:', e);
+        }
+      }, 0);
     };
 
-    const processPage = (url, page, wrapFn) => {
-      const pageText = url.match('am_farm') ? `&Farm_page=${page}` : `&page=${page}`;
-      return twLib.ajax({ url: url + pageText }).then((html) => wrapFn(page, $(html)));
-    };
-
-    const processAllPages = (url, processorFn) => {
-      const startPage = url.match('am_farm') ? 0 : -1;
-      const wrapFn = (p, $html) => {
-        const next = determineNextPage(p, $html);
-        processorFn($html);
-        if (next !== false) return processPage(url, next, wrapFn);
-        return true;
-      };
-      return processPage(url, startPage, wrapFn);
-    };
-
-    // Popup: always show immediately
     const showLoadingPopup = () => {
       const loadingHtml = `
         <style>#popup_box_FarmGod{text-align:center;width:600px;}</style>
@@ -374,9 +366,10 @@
           ${UI.Throbber[0].outerHTML}<br><br>
           <small>Opties laden…</small>
         </div>`;
-      Dialog.show('FarmGod', loadingHtml);
+      showPopup(loadingHtml);
     };
 
+    // ---------- Group select + options ----------
     const buildGroupSelect = (id) => {
       return $.get(TribalWars.buildURL('GET', 'groups', { ajax: 'load_group_menu' })).then((groups) => {
         let html = `<select class="optionGroup">`;
@@ -427,7 +420,50 @@
       });
     };
 
-    // Data gathering
+    // ---------- Multi-page processing ----------
+    const determineNextPage = (page, $html) => {
+      const isFarm = $html.find('#am_widget_Farm').length > 0;
+      const navSelect = $html.find('.paged-nav-item').first().closest('td').find('select').first();
+
+      let navLength = 0;
+      if (isFarm) {
+        const $nav = $html.find('#plunder_list_nav').first();
+        const $items = $nav.find('a.paged-nav-item, strong.paged-nav-item');
+        if ($items.length) navLength = safeNum(($items.last().text() || '').replace(/\D/g, ''), 0) - 1;
+      } else if (navSelect.length > 0) {
+        navLength = navSelect.find('option').length - 1;
+      } else {
+        navLength = $html.find('.paged-nav-item').not('[href*="page=-1"]').length;
+      }
+
+      const pageSize = $('#mobileHeader').length > 0 ? 10 : safeNum($html.find('input[name="page_size"]').val(), 25);
+      const villageLength =
+        $html.find('#scavenge_mass_screen').length > 0
+          ? $html.find('tr[id*="scavenge_village"]').length
+          : $html.find('tr.row_a, tr.row_ax, tr.row_b, tr.row_bx').length;
+
+      if (page === -1 && villageLength === 1000) return Math.floor(1000 / pageSize);
+      if (page < navLength) return page + 1;
+      return false;
+    };
+
+    const processPage = (url, page, wrapFn) => {
+      const pageText = url.match('am_farm') ? `&Farm_page=${page}` : `&page=${page}`;
+      return twLib.ajax({ url: url + pageText }).then((html) => wrapFn(page, $(html)));
+    };
+
+    const processAllPages = (url, processorFn) => {
+      const startPage = url.match('am_farm') ? 0 : -1;
+      const wrapFn = (p, $html) => {
+        const next = determineNextPage(p, $html);
+        processorFn($html);
+        if (next !== false) return processPage(url, next, wrapFn);
+        return true;
+      };
+      return processPage(url, startPage, wrapFn);
+    };
+
+    // ---------- Data gathering ----------
     const getData = (group, newbarbs, losses) => {
       const data = { villages: {}, commands: {}, farms: { templates: {}, farms: {} } };
       const skipUnits = ['ram', 'catapult', 'knight', 'snob', 'militia'];
@@ -472,7 +508,11 @@
 
       const farmProcessor = ($html) => {
         if ($.isEmptyObject(data.farms.templates)) {
-          const unitSpeeds = getUnitSpeeds() || {};
+          const unitSpeeds = (function () {
+            try { return JSON.parse(localStorage.getItem('FarmGod_unitSpeeds') || 'null') || {}; }
+            catch (_) { return {}; }
+          })();
+
           $html
             .find('form[action*="action=edit_all"]')
             .find('input[type="hidden"][name*="template"]')
@@ -536,7 +576,7 @@
           (txt.match(/[^\r\n]+/g) || []).forEach((row) => {
             const parts = row.split(',');
             if (parts.length < 5) return;
-            const [id, name, x, y, player_id] = parts;
+            const [id, _name, x, y, player_id] = parts;
             const coord = `${x}|${y}`;
             if (safeNum(player_id, -1) === 0 && !data.farms.farms[coord]) {
               data.farms.farms[coord] = { id: safeNum(id, 0) };
@@ -559,20 +599,14 @@
       };
 
       return Promise.all([
-        processAllPages(
-          TribalWars.buildURL('GET', 'overview_villages', { mode: 'combined', group: group }),
-          villagesProcessor
-        ),
-        processAllPages(
-          TribalWars.buildURL('GET', 'overview_villages', { mode: 'commands', type: 'attack' }),
-          commandsProcessor
-        ),
+        processAllPages(TribalWars.buildURL('GET', 'overview_villages', { mode: 'combined', group }), villagesProcessor),
+        processAllPages(TribalWars.buildURL('GET', 'overview_villages', { mode: 'commands', type: 'attack' }), commandsProcessor),
         processAllPages(TribalWars.buildURL('GET', 'am_farm'), farmProcessor),
         findNewbarbs(),
       ]).then(() => filterFarms());
     };
 
-    // Planning
+    // ---------- Planning ----------
     const createPlanning = (optionDistance, optionTime, optionMaxloot, optionMaxRows, data) => {
       const plan = { counter: 0, farms: {} };
       const serverTime = Math.round(getCurrentServerTime() / 1000);
@@ -631,11 +665,10 @@
           data.commands[targetCoord].push(arrival);
         }
       }
-
       return plan;
     };
 
-    // UI table & sending
+    // ---------- Table & sending ----------
     let curVillage = null;
     let farmBusy = false;
 
@@ -644,8 +677,7 @@
       const $next = $('.farmGod_icon').first();
       if (!$next.length) return;
       $next.addClass('farmGodNext');
-      try { $next.get(0).scrollIntoView(true); }
-      catch (_) { try { $(window).scrollTop($next.offset().top - 200); } catch (_) {} }
+      try { $next.get(0).scrollIntoView(true); } catch (_) {}
     };
 
     const sendFarm = ($icon) => {
@@ -691,7 +723,6 @@
           else UI.ErrorMessage(t.messages.villageError);
         });
 
-      // Enter triggers next
       $(document)
         .off('keydown.farmgod')
         .on('keydown.farmgod', (event) => {
@@ -773,13 +804,11 @@
       return html;
     };
 
-    // Planning runner (button)
     const runPlanning = (fromReplan) => {
       try {
-        const optionGroup = String($('.optionGroup').val() ?? 'all'); // FIX: keep "all"
+        const optionGroup = String($('.optionGroup').val() ?? 'all');
         const optionDistance = safeNum($('.optionDistance').val(), 25);
         const optionTime = safeNum($('.optionTime').val(), 10);
-
         let optionMaxRows = parseInt($('.optionMaxRows').val(), 10);
         if (!Number.isFinite(optionMaxRows) || optionMaxRows < 1) optionMaxRows = 60;
 
@@ -787,30 +816,16 @@
         const optionMaxloot = !!$('.optionMaxloot').prop('checked');
         const optionNewbarbs = !!$('.optionNewbarbs').prop('checked');
 
-        localStorage.setItem(
-          'farmGod_options',
-          JSON.stringify({
-            optionGroup,
-            optionDistance,
-            optionTime,
-            optionMaxRows,
-            optionLosses,
-            optionMaxloot,
-            optionNewbarbs,
-          })
-        );
+        localStorage.setItem('farmGod_options', JSON.stringify({
+          optionGroup, optionDistance, optionTime, optionMaxRows, optionLosses, optionMaxloot, optionNewbarbs
+        }));
 
-        if (!fromReplan) {
-          $('.optionsContent').html(UI.Throbber[0].outerHTML + '<br><br>');
-        } else {
-          $('.farmGodContent').prepend(`<div style="text-align:center;margin:8px 0;">${UI.Throbber[0].outerHTML}</div>`);
-        }
+        if (!fromReplan) $('.optionsContent').html(UI.Throbber[0].outerHTML + '<br><br>');
 
         return getData(optionGroup, optionNewbarbs, optionLosses).then((data) => {
           try { Dialog.close(); } catch (_) {}
 
           const plan = createPlanning(optionDistance, optionTime, optionMaxloot, optionMaxRows, data);
-
           $('.farmGodContent').remove();
           $('#am_widget_Farm').first().before(buildTable(plan.farms));
 
@@ -818,38 +833,36 @@
           UI.InitProgressBars();
           UI.updateProgressBar($('#FarmGodProgessbar'), 0, plan.counter);
           $('#FarmGodProgessbar').data('current', 0).data('max', plan.counter);
-
           focusNextRow();
+          finish(); // release guard after successful render
         });
       } catch (e) {
         console.error('FarmGod plan error:', e);
         UI.ErrorMessage('FarmGod: plan error (check console).');
+        finish();
       }
     };
 
-    // Init: popup always first, then options
-    const init = () => {
-      showLoadingPopup();
+    // ---- Init: show loading popup then replace with options ----
+    showLoadingPopup();
 
-      buildOptionsHtml()
-        .then((html) => {
-          $('#popup_box_FarmGod').html(html);
+    buildOptionsHtml()
+      .then((html) => {
+        showPopup(html);
+        // Bind after popup is in DOM (next tick)
+        setTimeout(() => {
           $('.optionButton').off('click').on('click', () => runPlanning(false));
           document.querySelector('.optionButton')?.focus();
-        })
-        .catch((e) => {
-          console.error('FarmGod options error:', e);
-          $('#popup_box_FarmGod').html(`<h3>${t.options.title}</h3><div class="error_box">FarmGod: opties konden niet laden. Check console.</div>`);
-        });
-    };
-
-    init();
+          // release guard even if user doesn't click immediately
+          finish();
+        }, 0);
+      })
+      .catch((e) => {
+        console.error('FarmGod options error:', e);
+        showPopup(`<h3>${t.options.title}</h3><div class="error_box">FarmGod: opties konden niet laden. Check console.</div>`);
+        finish();
+      });
   };
 
-  // Run after TW is ready (prevents first-run plan error from quickbar)
-  waitForTWReady(() => {
-    // Remove autorun flag if present (not required but keeps storage clean)
-    try { localStorage.removeItem(AUTORUN_KEY); } catch (_) {}
-    main();
-  });
+  waitForTWReady(main);
 })();
